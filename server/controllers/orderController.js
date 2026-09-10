@@ -91,7 +91,7 @@ export const placeOrderStripe = async (req, res) => {
     const session = await stripeInstance.checkout.sessions.create({
       line_items,
       mode: "payment",
-      success_url: `${origin}/loader?next=my-orders`,
+      success_url: `${origin}/loader?next=my-orders&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${origin}/cart`,
       metadata: {
         orderId: order._id.toString(),
@@ -115,16 +115,24 @@ export const stripeWebhook = async (request, response) => {
 
   try {
     event = stripeInstance.webhooks.constructEvent(
-      request.Body,
+      request.body,
       sig,
       process.env.STRIPE_WEBHOOK_SECRET,
     );
   } catch (error) {
-    response.status(400).send(`Webhook Error: ${error.message}`);
+    return response.status(400).send(`Webhook Error: ${error.message}`);
   }
 
   // Handle the event
   switch (event.type) {
+    case "checkout.session.completed": {
+      const session = event.data.object;
+      const { orderId, userId } = session.metadata;
+
+      await Order.findByIdAndUpdate(orderId, { isPaid: true });
+      await User.findByIdAndUpdate(userId, { cartItems: {} });
+      break;
+    }
     case "payment_intent.succeeded": {
       const paymentIntent = event.data.object;
       const paymentIntentId = paymentIntent.id;
@@ -148,7 +156,7 @@ export const stripeWebhook = async (request, response) => {
       const session = await stripeInstance.checkout.sessions.list({
         payment_intent: paymentIntentId,
       });
-      const { orderId} = session.data[0].metadata;
+      const { orderId } = session.data[0].metadata;
       await Order.findByIdAndDelete(orderId);
       break;
     }
@@ -156,6 +164,32 @@ export const stripeWebhook = async (request, response) => {
       console.error(`Unhandled event type ${event.type}`);
   }
   response.json({ received: true });
+};
+
+// Confirm a completed Checkout Session after returning from Stripe
+export const verifyStripeOrder = async (req, res) => {
+  try {
+    const { sessionId } = req.query;
+    if (!sessionId) {
+      return res.json({ success: false, message: "Missing checkout session" });
+    }
+
+    const stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY);
+    const session = await stripeInstance.checkout.sessions.retrieve(sessionId);
+    const { orderId, userId } = session.metadata || {};
+
+    if (session.payment_status !== "paid" || userId !== req.userId) {
+      return res.json({ success: false, message: "Payment is not completed" });
+    }
+
+    await Order.findByIdAndUpdate(orderId, { isPaid: true });
+    await User.findByIdAndUpdate(userId, { cartItems: {} });
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.log(error.message);
+    return res.json({ success: false, message: error.message });
+  }
 };
 
 // Get Orders by User ID : /api/order/user
